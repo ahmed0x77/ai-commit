@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+config.json
+install-state.json
+hooks/
+dispatch.sh
