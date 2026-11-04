@@ -21,7 +21,7 @@ from investigation import StreamGuard, InvestigationLimit
 
 HERE = Path(__file__).resolve().parent
 MAX_DIFF_BYTES = 240_000
-TIMEOUT = 60
+TIMEOUT = 180
 MODEL_FAMILY = "gemini-3.8-flash"
 EFFORTS = ("low", "medium", "high")
 DENY = [f"{action}(*)" for action in

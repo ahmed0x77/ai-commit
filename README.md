@@ -177,8 +177,8 @@ without the CLI or network. A client must execute standard Git hooks.
 Automatic messages are deliberately disabled for merge/rebase/cherry-pick/revert
 operations and amendments. Write a normal message in those cases. Diffs over
 240 KB and non-UTF-8 text stop instead of silently dropping changes.
-The CLI turn (investigation plus writing) is limited to 60 seconds, with a
-75-second outer process deadline as backup. Snapshot preparation has its own
+The CLI turn (investigation plus writing) is limited to 180 seconds, with a
+195-second outer process deadline as backup. Snapshot preparation has its own
 8-second budget. CLI startup, snapshot preparation, and cleanup add overhead;
 these limits are not a promise of a fixed response time. Simple obvious changes
 can be summarized without tool calls. Tests and commands are never run by the

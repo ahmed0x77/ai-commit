@@ -40,7 +40,7 @@ def main():
         before = git("diff", "--cached")
         print("Calling the real CLI through a normal Git commit in the test repository...", flush=True)
         result = subprocess.run(["git", "commit", "-m", "AI"], cwd=repo, env=env,
-                                capture_output=True, text=True, encoding="utf-8", timeout=160)
+                                capture_output=True, text=True, encoding="utf-8", timeout=ai_commit.TIMEOUT + 45)
         print(result.stderr, flush=True)
         if result.returncode:
             raise RuntimeError("Live CLI commit failed (only a temporary repository was touched).")
