@@ -3,7 +3,7 @@ from pathlib import Path
 import zipfile
 
 HERE = Path(__file__).resolve().parent
-FILES = ("ai_commit.py", "git_context.py", "process_tree.py", "prompt.txt", "install.py",
+FILES = ("ai_commit.py", "git_context.py", "process_tree.py", "project_context.py", "investigation.py", "prompt.txt", "install.py",
          "install.cmd", "uninstall.cmd", "setup.cmd", "README.md", ".gitignore",
          "build_release.py", "smoke_test.py", "tests/test_ai_commit.py")
 

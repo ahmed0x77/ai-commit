@@ -63,7 +63,8 @@ def install(destination: Path) -> None:
         # A failed first install can then be safely retried or uninstalled.
         state["active"] = False
         write(state_path, json.dumps(state, indent=2) + "\n")
-    for name in ("ai_commit.py", "git_context.py", "process_tree.py", "prompt.txt", "install.py", "README.md",
+    for name in ("ai_commit.py", "git_context.py", "process_tree.py", "project_context.py", "investigation.py",
+                 "prompt.txt", "install.py", "README.md",
                  "install.cmd", "uninstall.cmd", "setup.cmd"):
         source = HERE / name
         if source.resolve() != (dest / name).resolve():

@@ -1,8 +1,9 @@
 # AI commit messages through Antigravity CLI
 
 Stage the exact files or lines you want in your IDE. Enter `AI` in its commit
-message box, then click **Commit**. The helper summarizes the staged diff using
-Antigravity CLI and replaces the trigger before Git creates the commit.
+message box, then click **Commit**. Antigravity CLI examines the staged diff and
+can read/search an isolated project snapshot to understand related code. It
+replaces the trigger before Git creates the commit.
 You can add context with `AI: focus on preserving the selected workspace`.
 All triggers are case insensitive. Ordinary messages pass through unchanged.
 
@@ -80,6 +81,7 @@ notification; open its Git output/details panel to read the explanation.
 | Network / timeout | Check the connection or VPN, then retry or write a normal message. |
 | Model unavailable | Check `agy models` or update the CLI; no substitute model is used. |
 | Invalid / incomplete output | The commit stops; retry or write a normal message. |
+| Investigation exceeds its limits | The commit stops; retry with a focused hint or write a normal message. |
 | Unrecognized error | A generic troubleshooting message is shown; raw diagnostics are not echoed. |
 
 For example, a recognized authentication error appears as:
@@ -123,17 +125,33 @@ actions; this package builder only creates a local ZIP.
 - Uses the instructions and examples in `prompt.txt` for concise English titles
   and useful optional details. Existing Conventional Commit style is respected.
 - Sends the complete diff through stdin, never shell interpolation or command
-  arguments. Source is sent to the service behind your existing CLI login and
-  may be retained in the CLI's normal local conversation storage.
+  arguments. The diff and any context the agent reads are sent to the service
+  behind your existing CLI login and may be retained in its local conversations.
 - Runs a fresh CLI session in a temporary folder with a dedicated agent declaring
-  no tools, strict tool permissions, and explicit deny rules for file reads,
-  writes, commands, web operations, and MCP. It does not change saved CLI settings
-  or enable paid credit overage. The CLI still creates its own session metadata.
+  only `view_file`, `grep_search`, `list_dir`, and `find_by_name`. It can inspect
+  related definitions, imports, callers, and tests. All file writes, commands,
+  web operations, and MCP tools are explicitly denied. Original project reads
+  are denied; context reads are granted inside the temporary snapshot. Other
+  non-workspace reads require approval and are denied by the headless CLI.
+  Saved settings and paid credit overage remain unchanged. The CLI still creates
+  its own session metadata.
 - The CLI may start its configured integrations during initialization even when
   model tool calls are denied. Temporary workspace MCP overrides are supplied,
   but the installed CLI was observed still starting global MCP processes. The
   helper never edits your saved MCP configuration. A Windows process job contains
   each invocation, and timeout/exit cleanup terminates its child processes.
+- Exports text context directly from Git index blobs, including unchanged tracked
+  code. It never copies working-tree versions. Symlinks, submodules, agent/hook
+  instruction folders, credentials, binaries, and dependency trees are omitted.
+  Omitted counts are explicit in the context manifest; the staged diff remains
+  complete and authoritative even when some additional context is unavailable.
+- Bounds snapshot preparation to an 8-second budget, 2,000 files, 256 KB per file,
+  and 16 MB total. Changed files, project manifests, and nearby code have priority.
+  The agent is instructed to use at most six focused calls, with 200 lines per
+  read. A stream monitor stops it above eight read/search calls, 128 KB of tool
+  output, an out-of-snapshot read, delegation, or any other tool type. Permission
+  denials and the reader-only agent are the preventive controls; the stream
+  monitor is an additional check, not a replacement for those controls.
 - Stops on generation failure, timeout, invalid output, or changes to staging or
   HEAD during generation. It never auto-stages. It does not push.
 - Supports a preview without committing, from a repository's terminal:
@@ -158,8 +176,14 @@ without the CLI or network. A client must execute standard Git hooks.
 
 Automatic messages are deliberately disabled for merge/rebase/cherry-pick/revert
 operations and amendments. Write a normal message in those cases. Diffs over
-240 KB and non-UTF-8 text stop instead of silently dropping changes. Message
-generation is limited to 120 seconds, with an outer process timeout as backup.
+240 KB and non-UTF-8 text stop instead of silently dropping changes.
+The CLI turn (investigation plus writing) is limited to 60 seconds, with a
+75-second outer process deadline as backup. Snapshot preparation has its own
+8-second budget. CLI startup, snapshot preparation, and cleanup add overhead;
+these limits are not a promise of a fixed response time. Simple obvious changes
+can be summarized without tool calls. Tests and commands are never run by the
+agent. If TEMP is inside the original repository, the helper stops and requests
+an external temporary folder instead of weakening the original-folder boundary.
 The checks detect concurrent changes while generating; they do not lock out
 external programs after the final check. Existing hooks remain responsible for
 their normal checks and can still change/reject messages.
@@ -167,9 +191,11 @@ their normal checks and can still change/reject messages.
 ## Verification status on this machine
 
 The local integration suite covers real Git operations in disposable repositories
-with a fake CLI, including partial staging, hook forwarding, failed generation,
-invalid output, amend rejection, and timeout cleanup. Live CLI calls could not
-be verified from the execution environment: credential-free requests to both
+with a fake CLI, including partial staging, unchanged-code context, exclusion of
+unstaged versions, read-only tool policy, live stream limits, hook forwarding,
+failed generation, invalid output, amend rejection, and timeout cleanup. The
+latest live check stopped at its timeout without creating the synthetic commit.
+Live CLI calls could not be verified here: credential-free requests to both
 Google and the Antigravity API hosts timed out. This is a verification limitation,
 not evidence that the user's IDE or CLI login is broken. A live verification can
 be run from a normal terminal once network access is available:
@@ -179,8 +205,8 @@ python .\smoke_test.py
 ```
 
 The smoke test uses only synthetic files in a disposable repository. It generates
-a real message, checks that unstaged work remains excluded, and probes whether
-the configured agent refuses a file/command request. It does not change your
+a real message, checks that unstaged work remains excluded, verifies a snapshot
+read, and probes whether the agent refuses a file/command request. It does not change your
 normal Git configuration or create commits in your projects.
 
 ## Verification

@@ -19,6 +19,8 @@ sys.path.insert(0, str(SOURCE))
 spec = importlib.util.spec_from_file_location("ai_commit", SOURCE / "ai_commit.py")
 helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper)
+import project_context
+from investigation import StreamGuard, InvestigationLimit
 
 
 @contextmanager
@@ -66,6 +68,16 @@ if os.environ.get("FAKE_FAIL"):
 if os.environ.get("FAKE_ERROR"):
     print(json.dumps({"event": "result", "result": {"status": "ERROR", "error": os.environ["FAKE_ERROR"]}}))
     sys.exit(1)
+if os.environ.get("FAKE_CONTEXT_REPORT"):
+    content = json.loads(prompt)["message"]["content"]
+    metadata = json.loads(content.split("READ-ONLY INVESTIGATION CONTEXT:\\n", 1)[1])
+    root = pathlib.Path(metadata["project_root"])
+    report = {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8") for path in root.rglob("*") if path.is_file()}
+    pathlib.Path(os.environ["FAKE_CONTEXT_REPORT"]).write_text(json.dumps(report), encoding="utf-8")
+if os.environ.get("FAKE_STREAM"):
+    sys.stdout.write(os.environ["FAKE_STREAM"] + "\\n")
+    sys.stdout.flush()
+    time.sleep(120)
 print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": os.environ.get("FAKE_MESSAGE", "Add staged content")}}))
 ''', encoding="utf-8")
         if os.name == "nt":
@@ -391,10 +403,15 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
         args, kwargs = mock.call_args
         argv, request, work = args
         settings = json.loads(argv[argv.index("--settings") + 1])
-        self.assertEqual(settings["toolPermission"], "strict")
+        self.assertEqual(settings["toolPermission"], "request-review")
         self.assertIn("command(*)", settings["permissions"]["deny"])
         self.assertIn("write_file(*)", settings["permissions"]["deny"])
         self.assertIn("mcp(*)", settings["permissions"]["deny"])
+        self.assertNotIn("read_file(*)", settings["permissions"]["deny"])
+        self.assertEqual(settings["permissions"]["allow"], [f"read_file({(Path(work) / 'context').as_posix()})"])
+        self.assertIn("  - view_file", helper.AGENT)
+        self.assertNotIn("  - run_command", helper.AGENT)
+        self.assertNotIn("  - write_to_file", helper.AGENT)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-low")
         self.assertEqual(argv[argv.index("--effort") + 1], "low")
         self.assertNotEqual(Path(work), self.repo)
@@ -434,6 +451,128 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
             with self.assertRaises(subprocess.TimeoutExpired):
                 helper.invoke_cli([str(self.fake)], b"x" * 300_000, str(self.root))
         self.assertLess(time.monotonic() - started, 12)
+
+    def test_project_context_uses_index_versions_and_excludes_unfinished_work(self):
+        self.setup_install()
+        original = "def describe():\n    return 'INDEX_VERSION'\n"
+        self.stage("service.py", original)
+        self.stage("README.md", "A small translation service.\n")
+        self.git("commit", "-m", "Add service")
+        staged = "from service import describe\nprint(describe())\n"
+        self.stage("route.py", staged)
+        (self.repo / "route.py").write_text(staged + "UNSTAGED_ROUTE = True\n")
+        (self.repo / "service.py").write_text("UNSTAGED_SERVICE = True\n")
+        (self.repo / "later.py").write_text("UNTRACKED_CONTEXT = True\n")
+        report_path = self.root / "context-report.json"
+        self.env["FAKE_CONTEXT_REPORT"] = str(report_path)
+        self.git("commit", "-m", "AI")
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report["service.py"], original)
+        self.assertEqual(report["route.py"], staged)
+        self.assertIn("README.md", report)
+        self.assertNotIn("later.py", report)
+        self.assertEqual((self.repo / "service.py").read_text(), "UNSTAGED_SERVICE = True\n")
+        self.assertEqual((self.repo / "route.py").read_text(), staged + "UNSTAGED_ROUTE = True\n")
+
+    def test_snapshot_never_materializes_symlinks_or_project_agent_instructions(self):
+        index = (b"120000 " + b"a" * 40 + b" 0\toutside-link\0" +
+                 b"100644 " + b"b" * 40 + b" 0\t.agents/hooks.json\0" +
+                 b"100644 " + b"c" * 40 + b" 0\tAGENTS.md\0")
+        with patch.object(helper, "git") as git_call:
+            manifest = project_context.export_context(self.root / "context", index, (), git_call)
+        git_call.assert_not_called()
+        self.assertEqual(manifest["copied_files"], 0)
+        self.assertEqual(manifest["omitted_files"], 3)
+
+    def test_context_caps_prioritize_changed_code(self):
+        self.stage("a.py", "unchanged = 1\n")
+        self.stage("z.py", "changed = 1\n")
+        with cwd(self.repo), patch.dict(os.environ, self.env, clear=True), \
+                patch.object(project_context, "MAX_FILES", 1):
+            index = helper.git("ls-files", "--stage", "-z").stdout
+            manifest = project_context.export_context(self.root / "context", index, ("z.py",), helper.git)
+        self.assertEqual([item["path"] for item in manifest["files"]], ["z.py"])
+        self.assertEqual(manifest["omitted_files"], 1)
+        if os.name == "nt":
+            with self.assertRaises(PermissionError):
+                (self.root / "context/project/z.py").write_text("should not write")
+
+    def test_original_project_reads_and_all_mutations_are_denied(self):
+        settings = helper.session_settings(str(self.root / "work"), str(self.repo))
+        deny = settings["permissions"]["deny"]
+        self.assertIn(f"read_file({self.repo.as_posix()})", deny)
+        for action in ("write_file", "command", "read_url", "execute_url", "mcp"):
+            self.assertIn(f"{action}(*)", deny)
+
+    def test_running_cli_is_stopped_immediately_on_a_forbidden_tool(self):
+        event = json.dumps({"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "tool", "tool_name": "write_to_file", "state": "ACTIVE"}})
+        started = time.monotonic()
+        with patch.dict(os.environ, {"FAKE_STREAM": event}):
+            with self.assertRaisesRegex(helper.CommitError, "outside its read-only scope"):
+                helper.invoke_cli([str(self.fake)], b"{}", str(self.root))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_running_cli_is_stopped_after_eight_investigation_calls(self):
+        events = "\n".join(json.dumps({"event": "step_update", "step_update": {
+            "step_index": index, "step_type": "tool", "tool_name": "grep_search", "state": "ACTIVE"}})
+            for index in range(9))
+        started = time.monotonic()
+        with patch.dict(os.environ, {"FAKE_STREAM": events}):
+            with self.assertRaisesRegex(helper.CommitError, "exceeded 8"):
+                helper.invoke_cli([str(self.fake)], b"{}", str(self.root))
+        self.assertLess(time.monotonic() - started, 10)
+
+
+class InvestigationTests(unittest.TestCase):
+    def event(self, index=1, name="view_file", state="DONE", output="some code"):
+        return json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": "test", "step_index": index, "step_type": "tool",
+            "state": state, "tool_name": name, "tool_info": {"output": output}}}).encode()
+
+    def test_only_reading_and_search_are_allowed(self):
+        for name in ("run_command", "write_to_file", "replace_file_content", "invoke_subagent", "mcp_any_tool"):
+            with self.subTest(name=name), self.assertRaises(InvestigationLimit):
+                StreamGuard().observe(self.event(name=name))
+
+    def test_eight_calls_are_a_hard_limit_and_updates_are_deduplicated(self):
+        guard = StreamGuard()
+        for index in range(8):
+            guard.observe(self.event(index, state="ACTIVE"))
+            guard.observe(self.event(index))
+            guard.observe(self.event(index))
+        self.assertEqual(len(guard.calls), 8)
+        with self.assertRaises(InvestigationLimit):
+            guard.observe(self.event(8))
+
+    def test_returned_context_bytes_are_bounded(self):
+        with self.assertRaises(InvestigationLimit):
+            StreamGuard().observe(self.event(output="x" * 128_001))
+
+    def test_tool_paths_are_confined_to_the_snapshot(self):
+        scope = Path(tempfile.gettempdir()) / "guard-test-context"
+        event = json.loads(self.event())
+        event["step_update"]["tool_info"]["parameters"] = {"AbsolutePath": str(scope / "project/file.py")}
+        guard = StreamGuard(scope, scope.parent)
+        guard.observe(json.dumps(event))
+        event["step_update"]["tool_info"]["parameters"] = {"AbsolutePath": str(scope.parent / "outside.py")}
+        with self.assertRaises(InvestigationLimit):
+            guard.observe(json.dumps(event))
+
+    def test_missing_tool_tracking_or_target_is_rejected(self):
+        event = json.loads(self.event())
+        event["step_update"].pop("step_index")
+        with self.assertRaises(InvestigationLimit):
+            StreamGuard().observe(json.dumps(event))
+        with self.assertRaises(InvestigationLimit):
+            StreamGuard(Path(tempfile.gettempdir()) / "snapshot").observe(self.event())
+
+    def test_unsafe_snapshot_paths_are_rejected(self):
+        for path in ("../outside", "/etc/passwd", "C:/data", "folder\\file", "CON.txt",
+                     "folder/COM1", "file. ", ".env", "secrets.pem", ".agents/hooks.json", "GEMINI.md"):
+            with self.subTest(path=path):
+                self.assertFalse(project_context.safe_path(path))
+        self.assertTrue(project_context.safe_path("src/service.py"))
 
 
 if __name__ == "__main__":
