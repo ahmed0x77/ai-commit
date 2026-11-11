@@ -65,6 +65,12 @@ if os.environ.get("FAKE_BAD"):
     print("not json"); sys.exit(0)
 if os.environ.get("FAKE_FAIL"):
     sys.exit(9)
+if os.environ.get("FAKE_LOG_ERROR"):
+    content = json.loads(prompt)["message"]["content"]
+    metadata = json.loads(content.split("READ-ONLY INVESTIGATION CONTEXT:\\n", 1)[1])
+    work = pathlib.Path(metadata["project_root"]).parents[1]
+    (work / ".antigravity.log").write_text(os.environ["FAKE_LOG_ERROR"], encoding="utf-8")
+    sys.exit(1)
 if os.environ.get("FAKE_ERROR"):
     print(json.dumps({"event": "result", "result": {"status": "ERROR", "error": os.environ["FAKE_ERROR"]}}))
     sys.exit(1)
@@ -167,6 +173,7 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
         result = self.git("commit", "-m", "AI", check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("AI commit stopped", result.stderr)
+        self.assertIn("exit code 9", result.stderr)
         self.assertEqual(self.git("ls-files", "--stage").stdout, before)
         self.assertEqual((self.repo / ".git/COMMIT_EDITMSG").read_text().strip(), "AI")
         self.assertNotEqual(self.git("rev-parse", "--verify", "HEAD", check=False).returncode, 0)
@@ -309,12 +316,26 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
                                      ("RESOURCE_EXHAUSTED quota", "quota or rate limit"),
                                      ("connection refused", "could not connect"),
                                      ("invalid model selection", "model or thinking level"),
-                                     ("unexpected failure", "failed to generate")):
+                                     ("unexpected failure", "without a recognized error (exit code 1)")):
             with self.subTest(diagnostic=diagnostic):
                 result = subprocess.CompletedProcess([], 1, b"", (diagnostic + " private-marker").encode())
                 error = str(helper.cli_failure(result))
                 self.assertIn(expected, error)
                 self.assertNotIn("private-marker", error)
+
+    def test_tool_conflict_uses_the_cli_log_when_no_result_is_returned(self):
+        self.setup_install()
+        self.stage()
+        self.env["FAKE_LOG_ERROR"] = (
+            'Print mode: run ended with error and no response: failed to construct executor: '
+            'tool name conflict: multiple tools resolved with name "read_file" private-marker\n'
+            'Quota refresh failed during shutdown\n'
+        )
+        result = self.git("commit", "-m", "AI", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate tools in the commit agent", result.stderr)
+        self.assertNotIn("private-marker", result.stderr)
+        self.assertNotIn("quota", result.stderr)
 
     def test_malformed_result_shapes_are_handled_without_a_traceback(self):
         for payload in (b"[]", b"null", b'{"event":"result","result":[]}',
@@ -456,7 +477,7 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
         self.assertNotIn("read_file(*)", settings["permissions"]["deny"])
         self.assertEqual(settings["permissions"]["allow"], [f"read_file({(Path(work) / 'context').as_posix()})"])
         self.assertIn("  - view_file", helper.AGENT)
-        self.assertIn("  - read_file", helper.AGENT)
+        self.assertNotIn("  - read_file", helper.AGENT)  # CLI resolves view_file to read_file.
         self.assertNotIn("  - run_command", helper.AGENT)
         self.assertNotIn("  - write_to_file", helper.AGENT)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-low")

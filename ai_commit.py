@@ -24,6 +24,7 @@ INLINE_EVIDENCE_BYTES = 24_000
 TIMEOUT = 180
 MODEL_FAMILY = "gemini-3.8-flash"
 EFFORTS = ("low", "medium", "high")
+CLI_LOG = ".antigravity.log"
 DENY = [f"{action}(*)" for action in
         ("write_file", "read_url", "execute_url", "command", "mcp")]
 SETTINGS = {
@@ -37,7 +38,6 @@ AGENT = """---
 name: ai-commit-writer
 description: Investigate staged changes using read-only project context, then write a commit message.
 tools:
-  - read_file
   - view_file
   - grep_search
   - list_dir
@@ -247,6 +247,7 @@ def cli_args(executable: str, effort: str = "low", work: str | None = None,
     return [executable, "--input-format", "stream-json", "--output-format", "stream-json",
             "--disable-slash-commands", "--print-timeout", f"{TIMEOUT}s",
             "--model", f"{MODEL_FAMILY}-{effort}", "--effort", effort,
+            *(["--log-file", str(Path(work) / CLI_LOG)] if work else []),
             "--agent", "ai-commit-writer", "--settings", json.dumps(session_settings(work, source_root))]
 
 
@@ -264,31 +265,57 @@ def read_envelope(stdout: bytes) -> dict:
                           "Retry or enter your own commit message.") from exc
 
 
-def cli_failure(result: subprocess.CompletedProcess, envelope: dict | None = None) -> CommitError:
-    # Use diagnostics only to classify the failure; never echo source, credentials,
-    # URLs, or raw agent output into the IDE's Git log.
-    diagnostics = result.stderr.decode("utf-8", "replace")
-    if envelope:
-        diagnostics += "\n" + json.dumps(envelope.get("error", ""))
+def cli_log_failure(path: Path) -> str:
+    try:
+        with path.open("rb") as log:
+            size = log.seek(0, os.SEEK_END)
+            log.seek(max(0, size - 64_000))
+            tail = log.read(64_000).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    # Startup and shutdown warnings can mention unrelated services or quotas.
+    marker = "Print mode: run ended with error and no response:"
+    return next((line.split(marker, 1)[1].strip()
+                 for line in reversed(tail.splitlines()) if marker in line), "")
+
+
+def classify_cli_failure(diagnostics: str) -> str | None:
+    if re.search(r"(?i)tool name conflict|multiple tools resolved with name", diagnostics):
+        return "Antigravity found duplicate tools in the commit agent. Update AI Commit and retry."
     if re.search(r"(?i)auth[_ -]?required|authentication required|unauthenticated|not (?:logged|signed) in|"
-                 r"(?:log|sign)[ -]?in required|invalid_grant|(?:credential|token).{0,40}expired|\b401\b", diagnostics):
-        return CommitError("Antigravity needs you to sign in. Open a terminal, run agy, "
-                           "complete sign-in, then retry the commit. No commit was created.")
-    if re.search(r"(?i)\b429\b|rate[ _-]?limit|quota|resource_exhausted|insufficient credits", diagnostics):
-        return CommitError("Antigravity's quota or rate limit was reached. Wait for it to reset, "
-                           "then retry, or enter your own commit message. No commit was created.")
+                 r"(?:log|sign)[ -]?in required|invalid_grant|(?:credential|token).{0,40}expired|"
+                 r"\b401\s+unauthorized|\bhttp(?: status)?[ :]+401\b|"
+                 r'"(?:code|status)"\s*:\s*"?401\b', diagnostics):
+        return "Antigravity needs you to sign in. Open a terminal, run agy, complete sign-in, then retry."
+    if re.search(r"(?i)\b429\s+too many requests|\bhttp(?: status)?[ :]+429\b|"
+                 r'"(?:code|status)"\s*:\s*"?429\b|rate[ _-]?limit|'
+                 r"quota.{0,20}(?:exceeded|exhausted)|resource_exhausted|insufficient credits", diagnostics):
+        return "Antigravity's quota or rate limit was reached. Wait for it to reset, then retry."
     if re.search(r"(?i)invalid model|model.{0,100}(?:not recognized|not found|unavailable|not supported)|"
                  r"unsupported effort|has no .{0,20}effort", diagnostics):
-        return CommitError("The requested Gemini 3.8 Flash model or thinking level is unavailable. "
-                           "Check model access with agy models or update Antigravity CLI, then retry. "
-                           "No substitute model was used.")
-    if re.search(r"(?i)network|connection|timed? out|timeout|dns|tls|certificate|no such host|"
-                 r"unreachable|econn|deadline exceeded", diagnostics):
-        return CommitError("Antigravity could not connect. Check your network or VPN and retry, "
-                           "or enter your own commit message. No commit was created.")
-    return CommitError("Antigravity failed to generate a message. Run agy in a terminal to check "
-                       "login, network, quota, and model access, then retry, or enter your own "
-                       "commit message. No commit was created.")
+        return ("The requested Gemini 3.8 Flash model or thinking level is unavailable. "
+                "Check access with agy models, then retry.")
+    if re.search(r"(?i)connection refused|connection reset|no such host|network is unreachable|"
+                 r"econn(?:refused|reset)|tls handshake timeout|certificate verify failed|"
+                 r"waiting for connection|awaiting headers", diagnostics):
+        return "Antigravity could not connect to its service. Check the connection and retry."
+    if re.search(r"(?i)deadline[_ ]exceeded|timed out|request timeout", diagnostics):
+        return "Antigravity reported a timeout. Retry the commit."
+    return None
+
+
+def cli_failure(result: subprocess.CompletedProcess, envelope: dict | None = None,
+                log_path: Path | None = None) -> CommitError:
+    # Classify the CLI's error without echoing credentials, paths, or source text.
+    error = json.dumps(envelope.get("error", ""), ensure_ascii=False) if envelope else ""
+    log_error = cli_log_failure(log_path) if log_path else ""
+    for diagnostic in (error, log_error, result.stderr.decode("utf-8", "replace")):
+        explanation = classify_cli_failure(diagnostic)
+        if explanation:
+            return CommitError(explanation)
+    exit_code = f" (exit code {result.returncode})" if result.returncode else ""
+    return CommitError(f"Antigravity stopped without a recognized error{exit_code}. "
+                       "Retry or enter a commit message manually.")
 
 
 def run_cli(prompt: str, effort: str = "low", context: IndexContext | None = None) -> str:
@@ -298,6 +325,7 @@ def run_cli(prompt: str, effort: str = "low", context: IndexContext | None = Non
     if not executable or not Path(executable).is_file():
         raise CommitError("Antigravity CLI was not found. Install it and sign in with agy.")
     with tempfile.TemporaryDirectory(prefix="ai-commit-", ignore_cleanup_errors=True) as work:
+        log_path = Path(work) / CLI_LOG
         if context and Path(work).resolve().is_relative_to(Path(context.source_root).resolve()):
             raise CommitError("The temporary folder must be outside this repository. "
                               "Set TEMP to an external folder, then retry.")
@@ -322,16 +350,16 @@ def run_cli(prompt: str, effort: str = "low", context: IndexContext | None = Non
             result = invoke_cli(args, (json.dumps({"event": "user", "message": {"content": prompt}},
                                        ensure_ascii=False) + "\n").encode("utf-8"), work)
         except subprocess.TimeoutExpired as exc:
-            raise CommitError("Antigravity timed out. Check your connection and retry, "
-                              "or enter your own commit message. No commit was created.") from exc
+            raise CommitError(f"Antigravity exceeded the {TIMEOUT}-second time limit. "
+                              "Retry or enter a commit message manually.") from exc
         try:
             envelope = read_envelope(result.stdout)
         except CommitError:
             if result.returncode:
-                raise cli_failure(result) from None
+                raise cli_failure(result, log_path=log_path) from None
             raise
         if result.returncode or envelope.get("status") != "SUCCESS":
-            raise cli_failure(result, envelope)
+            raise cli_failure(result, envelope, log_path)
         if envelope.get("finished_reason"):
             raise CommitError("Antigravity stopped before completing its response. "
                               "Retry or write a message manually.")

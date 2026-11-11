@@ -82,7 +82,8 @@ notification; open its Git output/details panel to read the explanation.
 | Model unavailable | Check `agy models` or update the CLI; no substitute model is used. |
 | Invalid / incomplete output | The commit stops; retry or write a normal message. |
 | Investigation exceeds its limits | The commit stops; retry with a focused hint or write a normal message. |
-| Unrecognized error | A generic troubleshooting message is shown; raw diagnostics are not echoed. |
+| Duplicate agent tools | Update AI Commit and retry. |
+| Unrecognized error | Git reports that the cause could not be identified and shows the CLI exit code when available. |
 
 For example, a recognized authentication error appears as:
 
@@ -94,8 +95,9 @@ run agy, complete sign-in, then retry the commit. No commit was created.
 Generation failures leave the trigger and staged selection intact. The helper
 never silently commits `AI` as a fallback. It does not launch an interactive
 login from the commit hook. A manually written message still works without the
-model. Error classification is best effort: unexpected CLI errors use the
-generic message rather than guessing that you need to sign in.
+model. The helper classifies errors from the CLI response, standard error, and
+the final error in the invocation log. Git output uses fixed messages to keep
+raw diagnostics private.
 
 ## Share a copy or publish the source
 
