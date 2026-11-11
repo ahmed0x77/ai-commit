@@ -63,7 +63,7 @@ def main():
             (project / "probe.txt").write_text("SNAPSHOT_ONLY_PROBE\n", encoding="utf-8")
             args = ai_commit.cli_args(agy, work=workspace)
             read_prompt = ("Write a short commit title for this synthetic test. First read "
-                           "context/project/probe.txt with view_file. Include its single word "
+                           "context/project/probe.txt with your file reader. Include its single word "
                            "in the title so the test can verify snapshot access. Do not edit anything.")
             read_request = json.dumps({"event": "user", "message": {"content": read_prompt}}) + "\n"
             read_result = ai_commit.invoke_cli(args, read_request.encode("utf-8"), workspace)

@@ -2,7 +2,13 @@
 import json
 from pathlib import Path
 
-READ_TOOLS = frozenset({"view_file", "grep_search", "list_dir", "find_by_name"})
+READ_TARGETS = {
+    "read_file": "Path",
+    "view_file": "AbsolutePath",
+    "grep_search": "SearchPath",
+    "list_dir": "DirectoryPath",
+    "find_by_name": "SearchDirectory",
+}
 MAX_TOOL_CALLS = 8
 MAX_READ_BYTES = 128_000
 
@@ -37,16 +43,15 @@ class StreamGuard:
         if not isinstance(info, dict):
             raise InvestigationLimit("The CLI returned invalid tool activity; the commit was stopped.")
         name = step.get("tool_name") or info.get("name")
-        if not isinstance(name, str) or name not in READ_TOOLS:
+        if not isinstance(name, str) or name not in READ_TARGETS:
             raise InvestigationLimit("The commit agent attempted a tool outside its read-only scope.")
         parameters = info.get("parameters") or {}
-        path_key = {"view_file": "AbsolutePath", "grep_search": "SearchPath",
-                    "list_dir": "DirectoryPath", "find_by_name": "SearchDirectory"}[name]
+        path_key = READ_TARGETS[name]
         if not isinstance(parameters, dict):
             raise InvestigationLimit("The CLI returned invalid read-tool parameters.")
         if self.scope and step.get("state") == "DONE" and path_key not in parameters:
             raise InvestigationLimit("The CLI did not report the read target; the commit was stopped.")
-        if self.scope and isinstance(parameters, dict) and path_key in parameters:
+        if self.scope and path_key in parameters:
             raw_path = parameters[path_key]
             if not isinstance(raw_path, str):
                 raise InvestigationLimit("The commit agent supplied an invalid context path.")

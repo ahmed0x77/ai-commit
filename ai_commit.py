@@ -37,6 +37,7 @@ AGENT = """---
 name: ai-commit-writer
 description: Investigate staged changes using read-only project context, then write a commit message.
 tools:
+  - read_file
   - view_file
   - grep_search
   - list_dir
@@ -376,8 +377,6 @@ def handle_hook(message_path: str, source: str = "") -> None:
         raise CommitError("Automatic messages are disabled for merges, rebases, "
                           "cherry-picks, reverts, and amendments. Use a normal message.")
     prompt, before, context = snapshot(request.hint)
-    print(f"AI commit: Gemini 3.8 Flash ({request.effort}): checking context and writing a message...",
-          file=sys.stderr, flush=True)
     message = run_cli(prompt, request.effort, context)
     if fingerprint() != before:
         raise CommitError("The staged changes or HEAD changed during generation. "
@@ -391,7 +390,8 @@ def handle_hook(message_path: str, source: str = "") -> None:
         raise CommitError("The generated message cannot use this repository's "
                           "commit encoding. Write the message manually.") from exc
     path.write_bytes(encoded)
-    print("AI commit message:\n" + message.rstrip(), file=sys.stderr, flush=True)
+    print(f"AI commit message via Gemini 3.8 Flash ({request.effort}):\n{message.rstrip()}",
+          file=sys.stderr, flush=True)
 
 
 def main() -> int:

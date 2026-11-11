@@ -131,8 +131,9 @@ actions; this package builder only creates a local ZIP.
   The initial prompt and any pages or context the agent reads are sent to the
   service behind your existing CLI login and may be retained in its local
   conversations.
-- Runs a fresh CLI session in a temporary folder with a dedicated agent declaring
-  only `view_file`, `grep_search`, `list_dir`, and `find_by_name`. It can inspect
+- Runs a fresh CLI session in a temporary folder with a dedicated read-only
+  agent. It supports `read_file` and the older `view_file`, `grep_search`,
+  `list_dir`, and `find_by_name` tools when available. It can inspect
   related definitions, imports, callers, and tests. All file writes, commands,
   web operations, and MCP tools are explicitly denied. Original project reads
   are denied; context reads are granted inside the temporary snapshot. Other

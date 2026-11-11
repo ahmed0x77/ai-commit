@@ -78,6 +78,10 @@ if os.environ.get("FAKE_DIFF_REPORT"):
     content = json.loads(prompt)["message"]["content"]
     metadata = json.loads(content.split("READ-ONLY INVESTIGATION CONTEXT:\\n", 1)[1])
     root = pathlib.Path(metadata["diff_root"])
+    print(json.dumps({"event": "step_update", "step_update": {
+        "step_index": 2, "step_type": "tool", "state": "DONE", "tool_name": "read_file",
+        "tool_info": {"parameters": {"Path": str(root / "file-1-1.patch"), "StartLine": 1, "EndLine": 160}}
+    }}))
     report = {path.name: path.read_bytes().decode("utf-8") for path in root.iterdir()}
     pathlib.Path(os.environ["FAKE_DIFF_REPORT"]).write_text(json.dumps(report), encoding="utf-8")
 if os.environ.get("FAKE_STREAM"):
@@ -452,6 +456,7 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
         self.assertNotIn("read_file(*)", settings["permissions"]["deny"])
         self.assertEqual(settings["permissions"]["allow"], [f"read_file({(Path(work) / 'context').as_posix()})"])
         self.assertIn("  - view_file", helper.AGENT)
+        self.assertIn("  - read_file", helper.AGENT)
         self.assertNotIn("  - run_command", helper.AGENT)
         self.assertNotIn("  - write_to_file", helper.AGENT)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-low")
@@ -593,13 +598,16 @@ class InvestigationTests(unittest.TestCase):
 
     def test_tool_paths_are_confined_to_the_snapshot(self):
         scope = Path(tempfile.gettempdir()) / "guard-test-context"
-        event = json.loads(self.event())
-        event["step_update"]["tool_info"]["parameters"] = {"AbsolutePath": str(scope / "project/file.py")}
-        guard = StreamGuard(scope, scope.parent)
-        guard.observe(json.dumps(event))
-        event["step_update"]["tool_info"]["parameters"] = {"AbsolutePath": str(scope.parent / "outside.py")}
-        with self.assertRaises(InvestigationLimit):
-            guard.observe(json.dumps(event))
+        for tool, path_key in (("view_file", "AbsolutePath"), ("read_file", "Path")):
+            with self.subTest(tool=tool):
+                event = json.loads(self.event(name=tool))
+                info = event["step_update"]["tool_info"]
+                info["parameters"] = {path_key: str(scope / "project/file.py")}
+                guard = StreamGuard(scope, scope.parent)
+                guard.observe(json.dumps(event))
+                info["parameters"][path_key] = str(scope.parent / "outside.py")
+                with self.assertRaisesRegex(InvestigationLimit, "read outside its snapshot"):
+                    guard.observe(json.dumps(event))
 
     def test_missing_tool_tracking_or_target_is_rejected(self):
         event = json.loads(self.event())
