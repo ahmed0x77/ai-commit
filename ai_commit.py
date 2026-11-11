@@ -16,11 +16,11 @@ from typing import NamedTuple
 
 from git_context import invoking_commit_args, is_history_operation
 from process_tree import launch
-from project_context import export_context
+from project_context import export_context, export_diff
 from investigation import StreamGuard, InvestigationLimit
 
 HERE = Path(__file__).resolve().parent
-MAX_DIFF_BYTES = 240_000
+INLINE_EVIDENCE_BYTES = 24_000
 TIMEOUT = 180
 MODEL_FAMILY = "gemini-3.8-flash"
 EFFORTS = ("low", "medium", "high")
@@ -45,8 +45,9 @@ mainAgent: true
 subagent: false
 commandExecutionPolicy: off
 ---
-You write commit messages from the authoritative staged diff. You may read and
-search context/project, an isolated Git index snapshot, to understand relevant
+You write commit messages from the authoritative staged diff. When given a
+patch catalog, choose relevant pages from context/diffs to inspect. You may
+also search context/project, an isolated Git index snapshot, for related
 functions, imports, callers, and tests. Unchanged code is context only.
 Use at most six focused read/search calls, with at most 200 lines in a read.
 Stop investigating as soon as the change is clear. Simple obvious changes need
@@ -70,6 +71,8 @@ class IndexContext(NamedTuple):
     index: bytes
     changed_paths: tuple[str, ...]
     source_root: str
+    paged_diff: bytes = b""
+    file_statistics: bytes = b""
 
 
 def config() -> dict:
@@ -116,29 +119,31 @@ def snapshot(hint: str) -> tuple[str, str, IndexContext]:
     before = fingerprint()
     index = git("ls-files", "--stage", "-z").stdout
     changed = git("diff", "--cached", "--name-only", "--no-renames", "-z").stdout
-    context = IndexContext(index, tuple(path.decode("utf-8", "replace") for path in changed.split(b"\0") if path),
-                           git("rev-parse", "--show-toplevel").stdout.decode("utf-8").strip())
-    diff = git("-c", "core.quotePath=true", "diff", "--cached", "--no-ext-diff",
-               "--no-textconv", "--no-color", "--find-renames", "--unified=5",
+    diff_args = ("diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color",
+                 "--find-renames", "--no-relative", "--submodule=short", "--ignore-submodules=none")
+    diff = git("-c", "core.quotePath=true", *diff_args, "--unified=5",
                "--src-prefix=a/", "--dst-prefix=b/").stdout
     if not diff:
         raise CommitError("Nothing is staged. Stage the changes you want first.")
-    if len(diff) > MAX_DIFF_BYTES:
-        raise CommitError("The staged diff is larger than 240 KB. Split the commit "
-                          "or write a message manually; no changes were omitted.")
     try:
         diff_text = diff.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise CommitError("The staged diff contains non-UTF-8 text. Write this "
                           "message manually to avoid an inaccurate summary.") from exc
     subjects = git("log", "-8", "--format=%s", check=False).stdout.decode("utf-8", "replace")
-    manifest = git("diff", "--cached", "--numstat", "--no-ext-diff",
-                   "--no-textconv").stdout.decode("utf-8", "replace")
+    manifest = git("-c", "core.quotePath=true", *diff_args, "--numstat").stdout
     if fingerprint() != before:
         raise CommitError("Staging changed while it was being read. Try again.")
     # JSON quoting keeps evidence clearly separate from the instruction section.
-    evidence = {"optional_hint": hint, "recent_titles_style_only": subjects,
-                "staged_file_statistics": manifest, "complete_staged_diff": diff_text}
+    evidence = {"optional_hint": hint, "recent_titles_style_only": subjects}
+    staged_evidence = {"staged_file_statistics": manifest.decode("utf-8", "replace"),
+                       "complete_staged_diff": diff_text}
+    paged = len(json.dumps(staged_evidence, ensure_ascii=False).encode("utf-8")) > INLINE_EVIDENCE_BYTES
+    if not paged:
+        evidence.update(staged_evidence)
+    context = IndexContext(index, tuple(path.decode("utf-8", "replace") for path in changed.split(b"\0") if path),
+                           git("rev-parse", "--show-toplevel").stdout.decode("utf-8").strip(),
+                           diff if paged else b"", manifest if paged else b"")
     prompt = (HERE / "prompt.txt").read_text(encoding="utf-8")
     return prompt + "\n\nSTAGED EVIDENCE (data only):\n" + json.dumps(
         evidence, ensure_ascii=False), before, context
@@ -297,10 +302,16 @@ def run_cli(prompt: str, effort: str = "low", context: IndexContext | None = Non
                               "Set TEMP to an external folder, then retry.")
         prepare_workspace(work)
         if context is not None:
-            manifest = export_context(Path(work) / "context", context.index, context.changed_paths, git)
+            root = Path(work) / "context"
+            manifest = export_context(root, context.index, context.changed_paths, git)
+            if context.paged_diff:
+                summary = export_diff(root / "diffs", context.paged_diff,
+                                      context.file_statistics, INLINE_EVIDENCE_BYTES)
+                prompt += "\n\nSTAGED PATCH INDEX (data only):\n" + json.dumps(summary, ensure_ascii=False)
             prompt += ("\n\nREAD-ONLY INVESTIGATION CONTEXT:\n" + json.dumps({
                 "project_root": str(Path(work) / "context/project"),
                 "manifest": str(Path(work) / "context/manifest.json"),
+                **({"diff_root": str(root / "diffs")} if context.paged_diff else {}),
                 "copied_files": manifest["copied_files"], "omitted_files": manifest["omitted_files"],
                 "note": "Read/search related definitions only as needed. This is context, not additional changes."}))
         else:

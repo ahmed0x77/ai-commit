@@ -74,6 +74,12 @@ if os.environ.get("FAKE_CONTEXT_REPORT"):
     root = pathlib.Path(metadata["project_root"])
     report = {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8") for path in root.rglob("*") if path.is_file()}
     pathlib.Path(os.environ["FAKE_CONTEXT_REPORT"]).write_text(json.dumps(report), encoding="utf-8")
+if os.environ.get("FAKE_DIFF_REPORT"):
+    content = json.loads(prompt)["message"]["content"]
+    metadata = json.loads(content.split("READ-ONLY INVESTIGATION CONTEXT:\\n", 1)[1])
+    root = pathlib.Path(metadata["diff_root"])
+    report = {path.name: path.read_bytes().decode("utf-8") for path in root.iterdir()}
+    pathlib.Path(os.environ["FAKE_DIFF_REPORT"]).write_text(json.dumps(report), encoding="utf-8")
 if os.environ.get("FAKE_STREAM"):
     sys.stdout.write(os.environ["FAKE_STREAM"] + "\\n")
     sys.stdout.flush()
@@ -342,13 +348,49 @@ print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response":
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.git("config", "--global", "--get", "core.hooksPath", check=False).stdout.strip())
 
-    def test_large_diff_stops_without_cli_call(self):
+    def test_large_diff_is_paged_without_changing_what_git_commits(self):
         self.setup_install()
-        self.stage(text="long line\n" * 30_000)
-        self.fake.unlink()
-        result = self.git("commit", "-m", "AI", check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("larger than 240 KB", result.stderr)
+        self.stage("delete.txt", "deleted sentinel\n")
+        self.stage("old.txt", "renamed sentinel\n")
+        self.git("commit", "-m", "Initial files")
+        self.git("rm", "delete.txt")
+        self.git("mv", "old.txt", "new.txt")
+        self.stage("asset.bin", "asset\x00")
+        staged = "long line\n" * 30_000 + "final staged sentinel\n"
+        self.stage("large.txt", staged)
+        (self.repo / "large.txt").write_text(staged + "unstaged sentinel\n", encoding="utf-8")
+        expected = self.git("diff", "--cached", "--find-renames", "--unified=5").stdout
+        self.assertGreater(len(expected), 240_000)
+        prompt = self.root / "evidence.json"
+        report = self.root / "diff.json"
+        self.env.update(FAKE_PROMPT=str(prompt), FAKE_DIFF_REPORT=str(report))
+        self.git("commit", "-m", "AI3: large change")
+        request = json.loads(prompt.read_text(encoding="utf-8"))["message"]["content"]
+        self.assertIn("patch_catalog", request)
+        for name in ("delete.txt", "new.txt", "asset.bin", "large.txt"):
+            self.assertIn(name, request)
+        self.assertNotIn("final staged sentinel", request)
+        pages = json.loads(report.read_text(encoding="utf-8"))
+        ordered = sorted(pages, key=lambda name: tuple(map(int, Path(name).stem.split("-")[1:])))
+        self.assertEqual("".join(pages[name] for name in ordered).replace("\r\n", "\n"), expected)
+        self.assertTrue(all(len(page.encode()) <= project_context.PATCH_PAGE_BYTES and
+                            page.count("\n") <= project_context.PATCH_PAGE_LINES for page in pages.values()))
+        self.assertEqual(self.git("show", "HEAD:large.txt").stdout, staged)
+        self.assertIn(" M large.txt", self.git("status", "--porcelain").stdout)
+
+    def test_paged_catalog_and_long_utf8_lines_remain_readable(self):
+        staged_patch = b"diff --git a/file b/file\n+" + ("界" * 10_000).encode() + b"\n"
+        stats = b"1\t0\tfile\n"
+        destination = self.root / "diffs"
+        with patch.object(project_context, "PATCH_PAGE_BYTES", 11_999):
+            index = project_context.export_diff(destination, staged_patch, stats, inline_bytes=1)
+        self.assertEqual((destination / index["staged_file_statistics"]["first_page"]).read_bytes(), stats)
+        catalog = (destination / index["patch_catalog"]["first_page"]).read_text(encoding="utf-8")
+        self.assertIn("file-1-1.patch", catalog)
+        pages = [path.read_bytes() for path in sorted(destination.glob("*.patch"))]
+        self.assertEqual(b"".join(pages), staged_patch)
+        for page in pages:
+            page.decode("utf-8")
 
     def test_amend_with_explicit_ai_message_is_rejected(self):
         self.setup_install()

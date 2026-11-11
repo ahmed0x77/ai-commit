@@ -124,9 +124,13 @@ actions; this package builder only creates a local ZIP.
 - Supplies eight recent subjects as style examples, never as changes to include.
 - Uses the instructions and examples in `prompt.txt` for concise English titles
   and useful optional details. Existing Conventional Commit style is respected.
-- Sends the complete diff through stdin, never shell interpolation or command
-  arguments. The diff and any context the agent reads are sent to the service
-  behind your existing CLI login and may be retained in its local conversations.
+- Sends small staged diffs through stdin with their file statistics. When that
+  evidence would exceed 24 KB as JSON, sends a catalog and file statistics
+  instead, with read-only access to the complete patch in pages of up to 12 KB
+  and 160 lines. An oversized catalog and its statistics are also paged.
+  The initial prompt and any pages or context the agent reads are sent to the
+  service behind your existing CLI login and may be retained in its local
+  conversations.
 - Runs a fresh CLI session in a temporary folder with a dedicated agent declaring
   only `view_file`, `grep_search`, `list_dir`, and `find_by_name`. It can inspect
   related definitions, imports, callers, and tests. All file writes, commands,
@@ -175,8 +179,10 @@ failure reasons. Push alone does not generate a message. Normal messages work
 without the CLI or network. A client must execute standard Git hooks.
 
 Automatic messages are deliberately disabled for merge/rebase/cherry-pick/revert
-operations and amendments. Write a normal message in those cases. Diffs over
-240 KB and non-UTF-8 text stop instead of silently dropping changes.
+operations and amendments. Write a normal message in those cases. Large patches
+use selective reading, so their messages may cover fewer details. Git commits
+the entire staged selection regardless of the pages the model reads. Patches
+containing non-UTF-8 text stop instead of silently dropping changes.
 The CLI turn (investigation plus writing) is limited to 180 seconds, with a
 195-second outer process deadline as backup. Snapshot preparation has its own
 8-second budget. CLI startup, snapshot preparation, and cleanup add overhead;

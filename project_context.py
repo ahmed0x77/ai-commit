@@ -1,6 +1,7 @@
-"""Export bounded text context from Git index blobs, never working-tree files."""
+"""Export staged patches and text context, never working-tree files."""
 import json
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import time
 
@@ -8,9 +9,63 @@ MAX_FILES = 2000
 MAX_FILE_BYTES = 256_000
 MAX_TOTAL_BYTES = 16_000_000
 PREPARE_SECONDS = 8
+PATCH_PAGE_BYTES = 12_000
+PATCH_PAGE_LINES = 160
 CONTROL_DIRS = {".git", ".agents", ".codex", ".gemini", ".claude", "node_modules", "vendor"}
 CONTROL_FILES = {"agents.md", "gemini.md", "claude.md"}
 SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".jks"}
+
+
+def diff_pages(data: bytes):
+    """Split UTF-8 evidence without losing bytes, preferring line boundaries."""
+    start = 0
+    while start < len(data):
+        end = min(start + PATCH_PAGE_BYTES, len(data))
+        lines = data[start:end].split(b"\n", PATCH_PAGE_LINES)
+        if len(lines) > PATCH_PAGE_LINES:
+            end = start + sum(len(line) + 1 for line in lines[:PATCH_PAGE_LINES])
+        elif end < len(data):
+            newline = data.rfind(b"\n", start, end)
+            if newline >= start:
+                end = newline + 1
+            else:
+                while data[end] & 0xC0 == 0x80:
+                    end -= 1
+        yield data[start:end]
+        start = end
+
+
+def write_diff_pages(directory: Path, stem: str, extension: str, data: bytes) -> int:
+    count = 0
+    for count, page in enumerate(diff_pages(data), 1):
+        path = directory / f"{stem}-{count}.{extension}"
+        path.write_bytes(page)
+        path.chmod(stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+    return count
+
+
+def export_diff(directory: Path, diff: bytes, statistics: bytes, inline_bytes: int) -> dict:
+    directory.mkdir()
+    # Each top-level patch record starts here. A type change can produce two
+    # records, so don't assume a one-to-one mapping with Git's numstat rows.
+    boundaries = [match.start() for match in re.finditer(rb"(?m)^diff --git ", diff)]
+    catalog = []
+    starts = [0, *boundaries[1:]]
+    for number, (start, end) in enumerate(zip(starts, starts[1:] + [len(diff)]), 1):
+        patch = diff[start:end]
+        stem = f"file-{number}"
+        pages = write_diff_pages(directory, stem, "patch", patch)
+        header = patch.partition(b"\n")[0].decode("utf-8")
+        catalog.append(f"{stem}-1.patch ({pages} page{'s' if pages != 1 else ''})\t{header}")
+    summary = {"staged_file_statistics": statistics.decode("utf-8", "replace"),
+               "patch_catalog": "\n".join(catalog) + "\n"}
+    if len(json.dumps(summary, ensure_ascii=False).encode("utf-8")) > inline_bytes:
+        return {
+            label: {"first_page": f"{label}-1.txt",
+                    "page_count": write_diff_pages(directory, label, "txt", value.encode("utf-8"))}
+            for label, value in summary.items()
+        }
+    return summary
 
 
 def safe_path(name):
